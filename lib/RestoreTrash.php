@@ -1,208 +1,403 @@
 <?php
 
-use Sabre\Xml\Service;
-
 class RestoreTrash
 {
     private $uri;
     private $username;
     private $password;
-    private $sabreService;
     private $restoreDate;
+
+    /** @var array<int, array{remoteUrl:string, trashbinOriginalLocation:string, trashbinOriginalFilename:string, isDir:bool}> */
     private $trashbinData;
 
-    private int $ocShard  = 0;
-    private int $ocShards = 1;
-    private int $ocIndexFrom = 0;
-    private ?int $ocIndexTo  = null;
+    // Opcional: límites de reintento para MOVE / MKCOL
+    private $maxRetries = 4;
+    private $retryBaseSleepMs = 300;
 
     public function __construct($uri, $username, $password, $restoreDate)
     {
         $this->trashbinData = [];
-        $this->sabreService = new Service();
-        $this->uri = $uri;
-        $this->username = $username;
-        $this->password = $password;
+        $this->uri = rtrim((string)$uri, '/');
+        $this->username = (string)$username;
+        $this->password = (string)$password;
         $this->restoreDate = new DateTime($restoreDate);
-
-        $shards = getenv('OC_SHARDS');
-        $shard  = getenv('OC_SHARD');
-        $from   = getenv('OC_INDEX_FROM');
-        $to     = getenv('OC_INDEX_TO');
-
-        if ($shards !== false && ctype_digit((string)$shards)) $this->ocShards = max(1, (int)$shards);
-        if ($shard  !== false && ctype_digit((string)$shard))  $this->ocShard  = max(0, min((int)$shard, $this->ocShards - 1));
-        if ($from   !== false && ctype_digit((string)$from))   $this->ocIndexFrom = max(0, (int)$from);
-        if ($to     !== false && ctype_digit((string)$to))     $this->ocIndexTo = (int)$to;
-    }
-
-    private function depth(string $p): int {
-        return substr_count(trim($p, '/'), '/');
-    }
-
-    private function encodePathSegments(string $path): string {
-        $parts = array_filter(explode('/', $path), fn($s) => $s !== '');
-        return implode('/', array_map('rawurlencode', $parts));
-    }
-
-    private function ensureParents(string $destPath): void {
-        $parts = array_filter(explode('/', $destPath));
-        if (count($parts) <= 1) return;
-
-        $base = rtrim($this->uri, '/') . '/remote.php/dav/files/' . rawurlencode($this->username);
-        $cur = [];
-        for ($i = 0; $i < count($parts) - 1; $i++) {
-            $cur[] = $parts[$i];
-            $url = $base . '/' . $this->encodePathSegments(implode('/', $cur));
-
-            $ch = curl_init();
-            curl_setopt_array($ch, [
-                CURLOPT_URL => $url,
-                CURLOPT_USERPWD => "{$this->username}:{$this->password}",
-                CURLOPT_RETURNTRANSFER => 1,
-                CURLOPT_SSL_VERIFYHOST => 0,
-                CURLOPT_SSL_VERIFYPEER => 0,
-                CURLOPT_CUSTOMREQUEST => 'PROPFIND',
-                CURLOPT_HTTPHEADER => ['Depth: 0'],
-            ]);
-            curl_exec($ch);
-            $st = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-            curl_close($ch);
-
-            if ($st === 404) {
-                $mk = curl_init();
-                curl_setopt_array($mk, [
-                    CURLOPT_URL => $url,
-                    CURLOPT_USERPWD => "{$this->username}:{$this->password}",
-                    CURLOPT_RETURNTRANSFER => 1,
-                    CURLOPT_SSL_VERIFYHOST => 0,
-                    CURLOPT_SSL_VERIFYPEER => 0,
-                    CURLOPT_CUSTOMREQUEST => 'MKCOL',
-                ]);
-                curl_exec($mk);
-                curl_close($mk);
-            }
-        }
     }
 
     public function run()
     {
-        echo "Collecting trash data...\n";
+        echo "Collection files to restore\n";
         $this->collectTrashbinData();
-        echo sprintf("Found %d items\n", count($this->trashbinData));
-        $this->restoreTrashbinData();
+
+        // Sharding por variables de entorno (opcional)
+        $shard  = getenv('OC_SHARD')  !== false ? (int)getenv('OC_SHARD')  : 0;
+        $shards = getenv('OC_SHARDS') !== false ? (int)getenv('OC_SHARDS') : 1;
+        if ($shards < 1) $shards = 1;
+        if ($shard < 0 || $shard >= $shards) $shard = 0;
+
+        // Orden: primero directorios, luego archivos
+        $dirs  = [];
+        $files = [];
+        foreach ($this->trashbinData as $idx => $item) {
+            // Filtrar por shard si corresponde
+            if (($idx % $shards) !== $shard) continue;
+            if ($item['isDir']) $dirs[] = $item;
+            else $files[] = $item;
+        }
+
+        echo sprintf("Found %d items in shard %d/%d (dirs=%d, files=%d)\n",
+            count($dirs) + count($files), $shard, $shards, count($dirs), count($files));
+
+        // Restaurar: dirs primero
+        $this->restoreList($dirs);
+        // Luego archivos
+        $this->restoreList($files);
     }
 
-    private function collectTrashbinData()
+    private function restoreList(array $list)
     {
+        foreach ($list as $trashbinRecord) {
+            $dstPath = ltrim($trashbinRecord['trashbinOriginalLocation'], '/');
+
+            // Asegura que las carpetas destino existan (para archivos y también para carpetas anidadas)
+            $parent = $this->getParentPath($dstPath);
+            if ($parent !== '') {
+                try {
+                    $this->ensureDestinationDirs($parent);
+                } catch (\Throwable $e) {
+                    $this->logFail($trashbinRecord, "MKCOL parent fail: " . $e->getMessage());
+                    continue;
+                }
+            }
+
+            // MOVE desde trash hacia files
+            $ok = $this->moveFromTrash(
+                $trashbinRecord['remoteUrl'],
+                $dstPath,
+                $trashbinRecord['isDir']
+            );
+
+            if ($ok) $this->logOk($trashbinRecord);
+            else     $this->logFail($trashbinRecord, "(last HTTP )");
+        }
+    }
+
+    private function logOk(array $rec)
+    {
+        $kind = $rec['isDir'] ? 'DIR ' : 'FILE';
+        echo sprintf("[OK]  %s \xE2\x86\x92 %s\n", $kind, $rec['trashbinOriginalLocation']);
+    }
+
+    private function logFail(array $rec, string $reason)
+    {
+        $kind = $rec['isDir'] ? 'DIR ' : 'FILE';
+        echo sprintf("[FAIL] %s \xE2\x86\x92 %s %s\n", $kind, $rec['trashbinOriginalLocation'], $reason);
+    }
+
+    private function getParentPath(string $path): string
+    {
+        $norm = trim($path, '/');
+        if ($norm === '') return '';
+        $parts = explode('/', $norm);
+        array_pop($parts);
+        return implode('/', $parts);
+    }
+
+    /**
+     * Crea recursivamente las carpetas bajo /remote.php/dav/files/<user>/
+     */
+    private function ensureDestinationDirs(string $relativeDirPath): void
+    {
+        $relativeDirPath = trim($relativeDirPath, '/');
+        if ($relativeDirPath === '') return;
+
+        $segments = explode('/', $relativeDirPath);
+        $current = '';
+        foreach ($segments as $seg) {
+            $current = ($current === '' ? $seg : $current . '/' . $seg);
+            $this->mkcolIfNotExists($current);
+        }
+    }
+
+    private function mkcolIfNotExists(string $relativePath): void
+    {
+        // PROPFIND Depth:0 para ver si existe
+        $exists = $this->existsAtDestination($relativePath);
+        if ($exists) return;
+
+        $dstUrl = $this->uri . '/remote.php/dav/files/' . rawurlencode($this->username) . '/' . $this->encodePath($relativePath);
+        // MKCOL con reintentos
+        $attempt = 0;
+        while (true) {
+            $attempt++;
+            $ch = curl_init();
+            $headers = [
+                'Content-Length: 0'
+            ];
+            $opts = [
+                CURLOPT_URL => $dstUrl,
+                CURLOPT_CUSTOMREQUEST => 'MKCOL',
+                CURLOPT_NOBODY => true,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_USERPWD => "{$this->username}:{$this->password}",
+                CURLOPT_SSL_VERIFYHOST => 0,
+                CURLOPT_SSL_VERIFYPEER => 0,
+                CURLOPT_HTTPHEADER => $headers,
+            ];
+            curl_setopt_array($ch, $opts);
+            curl_exec($ch);
+            $http = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $err  = curl_errno($ch) ? curl_error($ch) : '';
+            curl_close($ch);
+
+            if ($http >= 200 && $http < 300) {
+                return; // creado
+            }
+            if ($http === 405 || $http === 301 || $http === 302) {
+                // ya existe o redirigió: tratar como OK
+                return;
+            }
+            if ($http === 409 || $http === 423) {
+                // Conflicto / Locked: reintenta con backoff
+                if ($attempt < $this->maxRetries) {
+                    usleep($this->sleepBackoffUs($attempt));
+                    continue;
+                }
+            }
+            if ($err !== '') {
+                throw new \RuntimeException("MKCOL '$relativePath' curl error: $err (HTTP $http)");
+            }
+            throw new \RuntimeException("MKCOL '$relativePath' HTTP $http");
+        }
+    }
+
+    private function existsAtDestination(string $relativePath): bool
+    {
+        $url = $this->uri . '/remote.php/dav/files/' . rawurlencode($this->username) . '/' . $this->encodePath($relativePath);
         $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_FAILONERROR => 1,
-            CURLOPT_RETURNTRANSFER => 1,
-            CURLOPT_URL => $this->uri . "/remote.php/dav/trash-bin/" . $this->username,
+        $headers = ['Depth: 0'];
+        $opts = [
+            CURLOPT_URL => $url,
+            CURLOPT_CUSTOMREQUEST => 'PROPFIND',
+            CURLOPT_NOBODY => false,
+            CURLOPT_RETURNTRANSFER => true,
             CURLOPT_USERPWD => "{$this->username}:{$this->password}",
             CURLOPT_SSL_VERIFYHOST => 0,
             CURLOPT_SSL_VERIFYPEER => 0,
-            CURLOPT_CUSTOMREQUEST => "PROPFIND",
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/xml',
-                'Depth: 1',
-            ],
-            CURLOPT_POSTFIELDS => '<?xml version="1.0"?>
-                <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
-                    <d:prop>
-                        <oc:trashbin-original-filename/>
-                        <oc:trashbin-original-location/>
-                        <oc:trashbin-delete-datetime/>
-                        <d:resourcetype/>
-                    </d:prop>
-                </d:propfind>'
-        ]);
-
-        $response = curl_exec($ch);
+            CURLOPT_HTTPHEADER => $headers,
+        ];
+        curl_setopt_array($ch, $opts);
+        curl_exec($ch);
+        $http = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        $data = $this->sabreService->parse($response);
-        array_shift($data);
+        return ($http >= 200 && $http < 300);
+    }
 
-        foreach ($data as $entry) {
-            $props = $entry['value'][1]['value'][0]['value'];
-            $file  = $props[0]['value'][0]['value'];
-            $loc   = $props[1]['value'];
-            $date  = new DateTime($props[2]['value']);
-            $type  = $props[3]['value'][0]['name'] ?? null;
+    private function moveFromTrash(string $remoteUrl, string $dstRelativePath, bool $isDir): bool
+    {
+        $src = $this->uri . $remoteUrl;
+        $dst = $this->uri . '/remote.php/dav/files/' . rawurlencode($this->username) . '/' . $this->encodePath($dstRelativePath);
 
-            if ($date < $this->restoreDate) continue;
-
-            $this->trashbinData[] = [
-                'remoteUrl' => $entry['value'][0]['value'],
-                'trashbinOriginalLocation' => $loc,
-                'trashbinOriginalFilename' => $file,
-                'isDir' => ($type === '{DAV:}collection'),
+        $attempt = 0;
+        while (true) {
+            $attempt++;
+            $ch = curl_init();
+            $headers = [
+                'Overwrite: F',
+                'Destination: ' . $dst,
             ];
+            $opts = [
+                CURLOPT_URL => $src,
+                CURLOPT_CUSTOMREQUEST => 'MOVE',
+                CURLOPT_NOBODY => true,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_USERPWD => "{$this->username}:{$this->password}",
+                CURLOPT_SSL_VERIFYHOST => 0,
+                CURLOPT_SSL_VERIFYPEER => 0,
+                CURLOPT_HTTPHEADER => $headers,
+            ];
+            curl_setopt_array($ch, $opts);
+            curl_exec($ch);
+            $http = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $err  = curl_errno($ch) ? curl_error($ch) : '';
+            curl_close($ch);
+
+            if ($http >= 200 && $http < 300) {
+                return true;
+            }
+
+            // Manejo de 409/423 con reintentos y MKCOL del parent por si acaso
+            if ($http === 409 || $http === 423) {
+                // Refuerza MKCOL del padre y reintenta
+                $parent = $this->getParentPath($dstRelativePath);
+                if ($parent !== '') {
+                    try { $this->ensureDestinationDirs($parent); } catch (\Throwable $e) { /* continúa */ }
+                }
+                if ($attempt < $this->maxRetries) {
+                    usleep($this->sleepBackoffUs($attempt));
+                    continue;
+                }
+            }
+
+            // 412 Precondition Failed si existe y Overwrite:F
+            if ($http === 412 || $http === 405) {
+                // Ya existe; considera como restaurado (no sobrescribir)
+                return true;
+            }
+
+            if ($err !== '') {
+                // error de curl; reintento si quedan intentos
+                if ($attempt < $this->maxRetries) {
+                    usleep($this->sleepBackoffUs($attempt));
+                    continue;
+                }
+                return false;
+            }
+
+            // Otros errores: sin reintento adicional
+            return false;
         }
     }
 
-    private function restoreTrashbinData()
+    private function sleepBackoffUs(int $attempt): int
     {
-        $dirs  = array_filter($this->trashbinData, fn($x) => $x['isDir']);
-        $files = array_filter($this->trashbinData, fn($x) => !$x['isDir']);
+        // backoff exponencial simple: 300ms, 600ms, 900ms, 1200ms...
+        $ms = $this->retryBaseSleepMs * $attempt;
+        return $ms * 1000;
+    }
 
-        usort($dirs,  fn($a,$b)=>$this->depth($a['trashbinOriginalLocation']) <=> $this->depth($b['trashbinOriginalLocation']));
-        usort($files, fn($a,$b)=>$this->depth($a['trashbinOriginalLocation']) <=> $this->depth($b['trashbinOriginalLocation']));
+    private function encodePath(string $path): string
+    {
+        // Codifica cada segmento con rawurlencode para evitar problemas con espacios/acentos
+        $clean = trim($path, '/');
+        if ($clean === '') return '';
+        $segments = explode('/', $clean);
+        $enc = array_map('rawurlencode', $segments);
+        return implode('/', $enc);
+    }
 
-        $todo = array_merge($dirs, $files);
+    /**
+     * PROPFIND al trash-bin para recolectar items (directorios y archivos)
+     */
+    private function collectTrashbinData()
+    {
+        $ch = curl_init();
 
-        if ($this->ocShards > 1) {
-            $todo = array_values(array_filter($todo, function($it){
-                $k = strtolower(ltrim($it['trashbinOriginalLocation'], '/'));
-                return (crc32($k) % $this->ocShards) === $this->ocShard;
-            }));
-            echo sprintf("Shard %d/%d: %d items\n", $this->ocShard, $this->ocShards, count($todo));
+        $curlOptions = [
+            CURLOPT_FAILONERROR    => 0, // mejor reportar que abortar
+            CURLOPT_RETURNTRANSFER => 1,
+            CURLOPT_URL            => $this->uri . "/remote.php/dav/trash-bin/" . rawurlencode($this->username),
+            CURLOPT_USERPWD        => "{$this->username}:{$this->password}",
+            CURLOPT_SSL_VERIFYHOST => 0,
+            CURLOPT_SSL_VERIFYPEER => 0,
+            CURLOPT_CUSTOMREQUEST  => "PROPFIND",
+            CURLOPT_HTTPHEADER     => [
+                'Content-Type: application/xml; charset=UTF-8',
+                'Depth: 1',
+            ],
+            CURLOPT_POSTFIELDS     => '<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:prop>
+    <oc:trashbin-original-filename/>
+    <oc:trashbin-original-location/>
+    <oc:trashbin-delete-datetime/>
+    <d:getcontentlength/>
+    <d:resourcetype/>
+  </d:prop>
+</d:propfind>'
+        ];
+
+        curl_setopt_array($ch, $curlOptions);
+        $response = curl_exec($ch);
+
+        if ($response === false) {
+            $err = curl_error($ch);
+            curl_close($ch);
+            throw new \RuntimeException("PROPFIND error: $err");
         }
 
-        $total = count($todo);
-        $from  = $this->ocIndexFrom;
-        $to    = $this->ocIndexTo ?? ($total - 1);
-        $todo  = array_slice($todo, $from, $to - $from + 1);
-        echo sprintf("Processing [%d..%d] (%d items)\n", $from, $to, count($todo));
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
 
-        foreach ($todo as $item) {
-            $dest = ltrim($item['trashbinOriginalLocation'], '/');
-            $this->ensureParents($dest);
+        if ($httpCode < 200 || $httpCode >= 300) {
+            // guardar para debug
+            @file_put_contents(__DIR__ . '/last-propfind.xml', $response);
+            throw new \RuntimeException("PROPFIND HTTP $httpCode. XML guardado en lib/last-propfind.xml");
+        }
 
-            $src = rtrim($this->uri, '/') . $item['remoteUrl'];
-            $dst = rtrim($this->uri, '/') . '/remote.php/dav/files/' . rawurlencode($this->username) . '/' . $this->encodePathSegments($dest);
+        // --- Parse robusto con SimpleXML ---
+        libxml_use_internal_errors(true);
+        $xml = simplexml_load_string($response);
+        if ($xml === false) {
+            @file_put_contents(__DIR__ . '/last-propfind.xml', $response);
+            $errs = array_map(function($e){ return trim($e->message); }, libxml_get_errors());
+            libxml_clear_errors();
+            throw new \RuntimeException("XML inválido. Errores: " . implode(' | ', $errs));
+        }
 
-            $max = 3; $try = 0; $ok = false;
-            while ($try < $max && !$ok) {
-                $ch = curl_init();
-                curl_setopt_array($ch, [
-                    CURLOPT_URL => $src,
-                    CURLOPT_USERPWD => "{$this->username}:{$this->password}",
-                    CURLOPT_RETURNTRANSFER => 1,
-                    CURLOPT_SSL_VERIFYHOST => 0,
-                    CURLOPT_SSL_VERIFYPEER => 0,
-                    CURLOPT_CUSTOMREQUEST => 'MOVE',
-                    CURLOPT_HTTPHEADER => [
-                        'Overwrite: F',
-                        'Destination: ' . $dst,
-                    ],
-                ]);
-                curl_exec($ch);
-                $st = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-                curl_close($ch);
+        $xml->registerXPathNamespace('d',  'DAV:');
+        $xml->registerXPathNamespace('oc', 'http://owncloud.org/ns');
 
-                if ($st >= 200 && $st < 300) {
-                    echo "[OK] $dest\n"; $ok = true;
-                } else {
-                    echo "[WARN $st] $dest (try " . ($try+1) . ")\n";
-                    if (in_array($st, [409,423,502,503], true)) usleep(300000);
-                    else break;
+        $responses = $xml->xpath('//d:multistatus/d:response');
+        if ($responses === false) $responses = [];
+
+        foreach ($responses as $r) {
+            // href
+            $hrefArr = $r->xpath('./d:href');
+            if (!$hrefArr || !isset($hrefArr[0])) continue;
+            $href = (string)$hrefArr[0];
+
+            // props
+            $propArr = $r->xpath('.//d:propstat/d:prop');
+            if (!$propArr || !isset($propArr[0])) continue;
+            $prop = $propArr[0];
+
+            $origNameArr = $prop->xpath('./oc:trashbin-original-filename');
+            $origLocArr  = $prop->xpath('./oc:trashbin-original-location');
+            $delAtArr    = $prop->xpath('./oc:trashbin-delete-datetime');
+
+            $origName = $origNameArr && isset($origNameArr[0]) ? (string)$origNameArr[0] : '';
+            $origLoc  = $origLocArr  && isset($origLocArr[0])  ? (string)$origLocArr[0]  : '';
+            $delAtStr = $delAtArr    && isset($delAtArr[0])    ? (string)$delAtArr[0]    : '';
+
+            // Tipado (archivo o directorio) mirando resourcetype
+            $isDir = false;
+            $rtArr = $prop->xpath('./d:resourcetype');
+            if ($rtArr && isset($rtArr[0])) {
+                $rtXml = $rtArr[0]->asXML();
+                if (is_string($rtXml) && stripos($rtXml, '<d:collection') !== false) {
+                    $isDir = true;
                 }
-                $try++;
             }
 
-            if (!$ok) echo "[FAIL] $dest\n";
+            // Saltar entradas vacías (p. ej., raíz)
+            if ($origName === '' && $origLoc === '' && $delAtStr === '') {
+                continue;
+            }
+
+            // fecha de borrado
+            try {
+                $delAt = new \DateTime($delAtStr);
+            } catch (\Throwable $e) {
+                continue;
+            }
+
+            // Only observe data which has been deleted after certain date
+            if ($delAt < $this->restoreDate) {
+                continue;
+            }
+
+            // Normaliza remoteUrl (quitar host si viene absoluta)
+            $remoteUrl = $href;
+            if (preg_match('#^https?://[^/]+(/.*)$#i', $remoteUrl, $m)) {
+                $remoteUrl = $m[1];
+            }
+
+            $this->trashbinData[] = [
+                'remoteUrl'                => $remoteUrl,
+                'trashbinOriginalLocation' => ltrim($origLoc, '/'),
+                'trashbinOriginalFilename' => $origName,
+                'isDir'                    => $isDir,
+            ];
         }
     }
 }
